@@ -1,6 +1,9 @@
 # Research session files (user-generated data)
 research_session_*.json
 
+# Tool state
+.omc/
+
 # Python
 __pycache__/
 *.py[cod]

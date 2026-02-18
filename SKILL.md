@@ -1,18 +1,19 @@
 ---
 name: academic-research
-description: Search, retrieve, and organize peer-reviewed academic literature from Semantic Scholar and PubMed. Use when asked to "find papers on [topic]", "build a literature review", "search the literature", explore citation networks, find works by a specific author, get paper recommendations, or continue a previous research session.
+description: Search, retrieve, organize, and verify peer-reviewed academic literature from Semantic Scholar, PubMed, and Crossref. Use when asked to "find papers on [topic]", "build a literature review", "search the literature", "verify citations", "check my references", explore citation networks, find works by a specific author, get paper recommendations, or continue a previous research session.
 ---
 
 # Academic Research Skill
 
 ## Purpose
 
-This skill enables Claude to search, retrieve, and organize peer-reviewed academic literature from **Semantic Scholar** and **PubMed** for use in writing medical research articles, literature reviews, case reports, and comparative reviews. It stores results in structured JSON session files that persist across conversations.
+This skill enables Claude to search, retrieve, organize, and **verify** peer-reviewed academic literature from **Semantic Scholar**, **PubMed**, and **Crossref** for use in writing medical research articles, literature reviews, case reports, and comparative reviews. It stores results in structured JSON session files that persist across conversations.
 
 ## When to Use This Skill
 
 - User asks to "find papers on [topic]", "build a literature review", "search the literature"
 - User is writing or editing a medical article and needs references
+- User wants to **verify citations** or **check references** in an existing article
 - User wants to explore citation networks (what cites a paper, what a paper cites)
 - User wants to find works by a specific author or research group
 - User wants paper recommendations based on seed papers
@@ -35,12 +36,16 @@ The Semantic Scholar API key is read in this order:
 
 PubMed E-utilities require no API key for basic use (rate limit: 3 req/sec). For higher throughput, an optional NCBI API key can be set via the `NCBI_API_KEY` environment variable or in the same config file as `{"ncbi_api_key": "YOUR_KEY"}`.
 
+Crossref requires no API key.
+
 ### First-Time Setup
 
-If no API key is configured, prompt the user to either:
+If no Semantic Scholar API key is configured, prompt the user to either:
 
 - Run: `export SEMANTIC_SCHOLAR_API_KEY="their_key"`
 - Or create `~/.semantic_scholar_config.json`
+
+Note: The skill degrades gracefully without a Semantic Scholar key -- search and verify still work via PubMed and Crossref. Citation counts and recommendations require Semantic Scholar.
 
 ## Execution Pattern
 
@@ -62,6 +67,11 @@ When the user asks to "find papers on [topic]":
 4. Session is auto-saved to a JSON file in the working directory
 5. Ask if the user wants to explore citations for any of the top papers
 
+Optional flags:
+- `--limit N` to control result count
+- `--year YYYY-YYYY` to filter by year range
+- `--filter therapy|diagnosis|prognosis|etiology|systematic_review` to apply PubMed clinical query hedges
+
 ### Workflow 2: Deep Literature Review
 
 When the user asks to "build a lit review on [topic]":
@@ -75,7 +85,33 @@ When the user asks to "build a lit review on [topic]":
 7. Present a structured summary grouped by theme
 8. Save the full session with thematic tags
 
-### Workflow 3: Citation Network Exploration
+### Workflow 3: Citation Verification
+
+When the user asks to "check my references", "verify citations", or provides a reference list:
+
+1. Prepare a JSON or text file with the references
+2. Run `python3 ~/.claude/skills/academic-research/academic_search.py verify <refs_file>`
+3. For each reference, the tool:
+   - Resolves DOIs via Crossref (authoritative DOI registry)
+   - Looks up PMIDs via PubMed
+   - Falls back to title/author search if no identifiers
+   - Compares manuscript fields against source-of-truth data
+   - Checks for retracted publications
+4. Present the verification report showing per-reference status (VERIFIED / ERRORS_FOUND / NOT_FOUND / RETRACTED)
+5. Highlight specific field mismatches (wrong year, wrong volume, etc.)
+
+JSON input format:
+```json
+[
+  {"title": "...", "authors": ["..."], "year": 2024, "doi": "...", "journal": "..."},
+  {"doi": "10.1234/example"},
+  {"pmid": "12345678"}
+]
+```
+
+Text input format: one reference per line or paragraph (DOIs and PMIDs are auto-extracted).
+
+### Workflow 4: Citation Network Exploration
 
 When the user asks "what cites this paper" or "trace citations":
 
@@ -84,15 +120,15 @@ When the user asks "what cites this paper" or "trace citations":
 3. Present results sorted by citation count
 4. Highlight papers in the same clinical domain
 
-### Workflow 4: Author Search
+### Workflow 5: Author Search
 
 When the user asks "find papers by [author]":
 
 1. Run `python3 ~/.claude/skills/academic-research/academic_search.py author <author name>`
-2. This searches Semantic Scholar for the author and fetches their papers
+2. Tries Semantic Scholar first; automatically falls back to PubMed if S2 is unavailable
 3. Present the author's publication list with citation metrics
 
-### Workflow 5: Paper Recommendations
+### Workflow 6: Paper Recommendations
 
 When the user asks "find similar papers" or "what else should I read":
 
@@ -100,7 +136,15 @@ When the user asks "find similar papers" or "what else should I read":
 2. Run `python3 ~/.claude/skills/academic-research/academic_search.py recommend <paper_id1> <paper_id2> ...`
 3. Present recommended papers with relevance context
 
-### Workflow 6: Resume Previous Session
+### Workflow 7: Paper Details
+
+When the user asks about a specific paper by DOI or PMID:
+
+1. Run `python3 ~/.claude/skills/academic-research/academic_search.py detail <doi_or_pmid>`
+2. Tries Semantic Scholar, falls back to Crossref (for DOIs) or PubMed (for PMIDs)
+3. Returns full metadata including volume, issue, pages
+
+### Workflow 8: Resume Previous Session
 
 When the user says "continue my research on [topic]" or "load my previous search":
 
@@ -109,11 +153,32 @@ When the user says "continue my research on [topic]" or "load my previous search
 3. Summarize previous findings
 4. Ask how to proceed
 
+## API Sources
+
+| Source | Purpose | Key Required |
+|---|---|---|
+| Semantic Scholar | Search, citation counts, citation graphs, author search, recommendations | Optional (rate-limited without) |
+| PubMed | Search, clinical trial metadata, retraction checking | No |
+| Crossref | DOI resolution, citation verification, volume/issue/pages metadata | No |
+
 ## API Rate Limiting
 
 - **Semantic Scholar**: 1 req/sec (authenticated). The script includes `time.sleep(1.1)` between calls.
 - **PubMed**: 3 req/sec without key, 10/sec with NCBI key. The script includes `time.sleep(0.35)` between calls.
+- **Crossref**: No hard limit for polite requests. The script includes `time.sleep(0.1)` between calls.
 - For large searches (deep lit reviews), inform the user that the process will take a moment.
+
+## Clinical Query Filters
+
+The `--filter` flag applies validated NLM clinical query hedges to PubMed searches:
+
+- `therapy` -- finds randomized controlled trials and treatment studies
+- `diagnosis` -- finds diagnostic accuracy and sensitivity/specificity studies
+- `prognosis` -- finds prognosis, mortality, and follow-up studies
+- `etiology` -- finds risk factor, cohort, and case-control studies
+- `systematic_review` -- finds systematic reviews and meta-analyses
+
+These are the "sensitive" (high-recall) versions of the NLM hedges.
 
 ## Session File Format
 
@@ -139,6 +204,9 @@ Session files are saved as `research_session_{topic_slug}_{date}.json` in the wo
       "authors": ["..."],
       "year": 2024,
       "journal": "...",
+      "volume": "...",
+      "issue": "...",
+      "pages": "...",
       "doi": "...",
       "pmid": "...",
       "semantic_scholar_id": "...",
@@ -169,7 +237,10 @@ Session files are saved as `research_session_{topic_slug}_{date}.json` in the wo
 
 - Semantic Scholar has stronger citation metrics and recommendation features
 - PubMed has better coverage of clinical trials, case reports, and clinical medicine literature
-- Always search BOTH sources and deduplicate for comprehensive results
+- Crossref is the authoritative source for DOI resolution and bibliographic metadata (volume, issue, pages)
+- Always search BOTH Semantic Scholar and PubMed and deduplicate for comprehensive results
+- When Semantic Scholar is unavailable, the skill degrades gracefully to PubMed + Crossref
 - When deduplicating, prefer the record with more complete metadata
-- Full text is NOT available through either API -- only abstracts and metadata
+- Full text is NOT available through any API -- only abstracts and metadata
 - Very recent publications (last 1-2 weeks) may have an indexing lag
+- The verify command checks for retracted publications via PubMed
