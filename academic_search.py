@@ -550,7 +550,7 @@ def parse_pubmed_article(article):
 def normalize_doi(doi):
     """Normalize a DOI string: strip URL prefix, doi: prefix, trailing punct."""
     doi = doi.strip().rstrip(".,;)")
-    doi = re.sub(r'^https?://doi\.org/', '', doi, flags=re.IGNORECASE)
+    doi = re.sub(r'^(?:https?://)?doi\.org/', '', doi, flags=re.IGNORECASE)
     doi = re.sub(r'^doi:\s*', '', doi, flags=re.IGNORECASE).strip()
     return doi
 
@@ -721,7 +721,7 @@ def parse_reference_text(text):
     # Extract year (prefer parenthesized year, then freestanding)
     year_match = re.search(r"\((\d{4})\)", cleaned)
     if not year_match:
-        year_match = re.search(r"[\.\s;,](\d{4})[\.\s;,]", cleaned)
+        year_match = re.search(r"(?:^|[\.\s;,])(\d{4})(?:$|[\.\s;,])", cleaned)
     if year_match:
         y = int(year_match.group(1))
         if 1900 <= y <= 2100:
@@ -801,12 +801,13 @@ def deduplicate_papers(s2_papers, pm_papers):
     """
     merged = {}
 
-    for p in s2_papers:
+    for i, p in enumerate(s2_papers):
         key = (
             p.get("doi")
             or p.get("pmid")
             or p.get("semantic_scholar_id")
             or p.get("title", "").lower()
+            or f"_untitled_{i}"
         )
         merged[key] = p
 
@@ -958,18 +959,10 @@ def format_paper_table(papers, max_papers=25):
 
 def _format_vol_issue_pages(p):
     """Build the ;Volume(Issue):Pages suffix for citation strings."""
-    parts = []
     vol = p.get("volume")
     iss = p.get("issue")
     pgs = p.get("pages")
-    if vol:
-        s = vol
-        if iss:
-            s += f"({iss})"
-        parts.append(s)
-    if pgs:
-        parts.append(pgs)
-    if not parts:
+    if not vol and not pgs:
         return ""
     if vol and pgs:
         return f";{vol}{'(' + iss + ')' if iss else ''}:{pgs}"
@@ -1364,7 +1357,10 @@ def parse_flags(args, flags):
                 i += 1
             elif i + 1 < len(args):
                 value = args[i + 1]
-                parsed[flag] = expected_type(value)
+                try:
+                    parsed[flag] = expected_type(value)
+                except (ValueError, TypeError):
+                    print(f"Warning: invalid value '{value}' for {flag}, skipping")
                 i += 2
             else:
                 print(f"Warning: {flag} requires a value")
