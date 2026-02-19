@@ -547,8 +547,17 @@ def parse_pubmed_article(article):
 # Crossref Functions
 # =============================================================================
 
+def normalize_doi(doi):
+    """Normalize a DOI string: strip URL prefix, doi: prefix, trailing punct."""
+    doi = doi.strip().rstrip(".,;)")
+    doi = re.sub(r'^https?://doi\.org/', '', doi, flags=re.IGNORECASE)
+    doi = re.sub(r'^doi:\s*', '', doi, flags=re.IGNORECASE).strip()
+    return doi
+
+
 def crossref_resolve_doi(doi):
     """Resolve a DOI via Crossref and return normalized metadata."""
+    doi = normalize_doi(doi)
     encoded = urllib.parse.quote(doi, safe="")
     result = crossref_request(f"{CROSSREF_BASE}/works/{encoded}")
     if "error" in result:
@@ -1022,6 +1031,8 @@ def verify_single_reference(ref, index):
     }
 
     doi = ref.get("doi")
+    if doi:
+        doi = normalize_doi(doi)
     pmid = ref.get("pmid")
 
     # --- Resolve via DOI (Crossref) ---
@@ -1032,6 +1043,20 @@ def verify_single_reference(ref, index):
             result["sources"]["crossref"] = cr_paper
         else:
             result["sources"]["crossref_error"] = cr_paper["error"]
+
+    # Fallback: Semantic Scholar DOI lookup when Crossref fails
+    if doi and not result["sources"].get("crossref"):
+        time.sleep(S2_RATE_DELAY)
+        s2_paper = s2_get_paper(f"DOI:{doi}")
+        if "error" not in s2_paper and s2_paper.get("title"):
+            result["sources"]["semantic_scholar"] = s2_paper
+
+    # Fallback: PubMed DOI search to obtain PMID when Crossref fails
+    if doi and not result["sources"].get("pubmed"):
+        time.sleep(PM_RATE_DELAY)
+        pm_doi = pm_search(f'"{doi}"[doi]', limit=1)
+        if pm_doi.get("papers"):
+            result["sources"]["pubmed"] = pm_doi["papers"][0]
 
     # --- Resolve via PMID (PubMed) ---
     if pmid:
@@ -1088,15 +1113,17 @@ def verify_single_reference(ref, index):
                             break
 
     # --- Pick best match for comparison ---
-    # Prefer PubMed (more authoritative for biomedical), fall back to Crossref
-    best = result["sources"].get("pubmed") or result["sources"].get("crossref")
+    # Prefer PubMed (more authoritative for biomedical), fall back to Crossref, then S2
+    best = (result["sources"].get("pubmed")
+            or result["sources"].get("crossref")
+            or result["sources"].get("semantic_scholar"))
     if not best:
         result["status"] = "NOT_FOUND"
         return result
 
     result["best_match"] = best
     source_count = sum(
-        1 for k in ("crossref", "pubmed") if result["sources"].get(k)
+        1 for k in ("crossref", "pubmed", "semantic_scholar") if result["sources"].get(k)
     )
 
     # --- Field-by-field comparison ---
@@ -1194,12 +1221,12 @@ def verify_single_reference(ref, index):
         if not match:
             has_error = True
 
-    # DOI cross-check
-    if ref.get("doi") and best.get("doi"):
-        match = ref["doi"].lower() == best["doi"].lower()
+    # DOI cross-check (use normalized doi for comparison)
+    if doi and best.get("doi"):
+        match = doi.lower() == best["doi"].lower()
         checks["doi"] = {
             "status": "match" if match else "mismatch",
-            "manuscript": ref["doi"],
+            "manuscript": doi,
             "source": best["doi"],
         }
         if not match:
@@ -1238,18 +1265,20 @@ def format_verification_report(results, retracted_pmids):
         ref_pmid = ref.get("pmid") or best.get("pmid")
         is_retracted = ref_pmid and str(ref_pmid) in retracted_pmids
 
+        label = ref.get("label")
+        label_str = f" [{label}]" if label else ""
         lines.append("")
         if is_retracted:
-            lines.append(f"Reference {idx}: *** RETRACTED ***")
+            lines.append(f"Reference {idx}{label_str}: *** RETRACTED ***")
             retraction_count += 1
         elif r["status"].startswith("VERIFIED"):
-            lines.append(f"Reference {idx}: {r['status']}")
+            lines.append(f"Reference {idx}{label_str}: {r['status']}")
             verified += 1
         elif r["status"].startswith("ERRORS"):
-            lines.append(f"Reference {idx}: {r['status']}")
+            lines.append(f"Reference {idx}{label_str}: {r['status']}")
             errors += 1
         else:
-            lines.append(f"Reference {idx}: NOT FOUND")
+            lines.append(f"Reference {idx}{label_str}: NOT FOUND")
             not_found += 1
 
         lines.append(f"  Title:  {title}")
@@ -1265,12 +1294,36 @@ def format_verification_report(results, retracted_pmids):
             else:
                 lines.append(f"  {field:<14} [{status_mark}]")
 
+        # Show confirmed metadata from best match
+        if r.get("best_match"):
+            bm = r["best_match"]
+            parts = []
+            vol = bm.get("volume")
+            issue = bm.get("issue")
+            pages = bm.get("pages")
+            if vol or issue or pages:
+                vip = f"Vol {vol}" if vol else ""
+                if issue:
+                    vip += f"({issue})" if vip else f"Issue {issue}"
+                if pages:
+                    vip += f":{pages}" if vip else pages
+                parts.append(vip)
+            if bm.get("pmid"):
+                parts.append(f"PMID: {bm['pmid']}")
+            authors = bm.get("authors", [])
+            if authors:
+                parts.append(f"Authors: {', '.join(str(a) for a in authors[:3])}")
+            if parts:
+                lines.append(f"  Confirmed:  {' | '.join(parts)}")
+
         # Show which sources found it
         sources_found = []
         if r["sources"].get("crossref"):
             sources_found.append("Crossref")
         if r["sources"].get("pubmed"):
             sources_found.append("PubMed")
+        if r["sources"].get("semantic_scholar"):
+            sources_found.append("Semantic Scholar")
         if sources_found:
             lines.append(f"  Sources: {', '.join(sources_found)}")
         elif r["sources"].get("crossref_error"):
@@ -1582,11 +1635,11 @@ def cmd_verify(args):
     3. Checks for retractions
     4. Reports per-reference verification status
     """
-    word_args, flags = parse_flags(args, {"--no-retraction-check": None})
+    word_args, flags = parse_flags(args, {"--no-retraction-check": None, "--output": str})
     if not word_args:
         print(
             "Usage: academic_search.py verify <references_file.json|.txt> "
-            "[--no-retraction-check]"
+            "[--output <file.json>] [--no-retraction-check]"
         )
         print("\nJSON format: [{\"title\": \"...\", \"doi\": \"...\", ...}, ...]")
         print("Text format: one reference per line or per paragraph")
@@ -1642,16 +1695,16 @@ def cmd_verify(args):
     print("\n" + format_verification_report(results, retracted_pmids))
 
     # JSON output
-    print("\n---JSON_DATA_START---")
     json_results = []
     for r in results:
         jr = {
             "index": r["index"],
+            "label": r["input"].get("label"),
             "status": r["status"],
             "input": r["input"],
             "field_checks": r["field_checks"],
             "sources_found": list(
-                k for k in ("crossref", "pubmed") if r["sources"].get(k)
+                k for k in ("crossref", "pubmed", "semantic_scholar") if r["sources"].get(k)
             ),
             "best_match": r.get("best_match"),
         }
@@ -1661,11 +1714,19 @@ def cmd_verify(args):
             jr["retracted"] = True
             jr["status"] = "RETRACTED"
         json_results.append(jr)
-    print(json.dumps(
+    json_blob = json.dumps(
         {"verification_results": json_results, "total": len(refs)},
         indent=2, default=str,
-    ))
-    print("---JSON_DATA_END---")
+    )
+    output_file = flags.get("--output")
+    if output_file:
+        with open(output_file, "w") as f:
+            f.write(json_blob)
+        print(f"\nJSON results written to: {output_file}")
+    else:
+        print("\n---JSON_DATA_START---")
+        print(json_blob)
+        print("---JSON_DATA_END---")
 
 
 def cmd_session(args):
@@ -1727,8 +1788,8 @@ if __name__ == "__main__":
         print("Commands:")
         print("  search <query> [--limit N] [--year YYYY-YYYY] [--filter TYPE]")
         print("         Search both sources. Filters: therapy, diagnosis, prognosis, etiology, systematic_review")
-        print("  verify <refs_file> [--no-retraction-check]")
-        print("         Verify citations against Crossref + PubMed")
+        print("  verify <refs_file> [--output <file.json>] [--no-retraction-check]")
+        print("         Verify citations against Crossref + Semantic Scholar + PubMed")
         print("  citations <paper_id> [--direction citedBy|references]")
         print("         Citation graph (Semantic Scholar)")
         print("  author <name>")

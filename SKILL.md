@@ -5,6 +5,30 @@ description: Search, retrieve, organize, and verify peer-reviewed academic liter
 
 # Academic Research Skill
 
+## CRITICAL: Invocation Rules
+
+**ALWAYS invoke via Bash, NOT via the Skill tool sub-agent.**
+
+```bash
+python3 ~/.claude/skills/academic-research/academic_search.py <command> [args]
+```
+
+### For citation verification — use `verify`, NEVER `search`:
+
+| Task | Correct command | Wrong command |
+|------|----------------|---------------|
+| Check specific known references | `verify refs.json` | `search "BRIDGE trial atrial fibrillation"` |
+| Find papers on a topic | `search "antiplatelet cardiac device"` | — |
+
+**Workflow for verify:**
+1. Create a JSON file in the project directory with DOIs, titles, authors
+2. Run `verify <abs_path_to_json> [--output <abs_path_to_results.json>]`
+3. Parse the output report
+
+`search` is for topic discovery only. Use `verify` or `detail` to look up specific known references by DOI or title.
+
+---
+
 ## Purpose
 
 This skill enables Claude to search, retrieve, organize, and **verify** peer-reviewed academic literature from **Semantic Scholar**, **PubMed**, and **Crossref** for use in writing medical research articles, literature reviews, case reports, and comparative reviews. It stores results in structured JSON session files that persist across conversations.
@@ -52,7 +76,11 @@ Note: The skill degrades gracefully without a Semantic Scholar key -- search and
 Always run the Python script using its installed location:
 
 ```bash
-python3 ~/.claude/skills/academic-research/academic_search.py <command> <args>
+# For citation verification (PREFERRED pattern):
+python3 ~/.claude/skills/academic-research/academic_search.py verify /abs/path/refs.json --output /abs/path/results.json
+
+# For topic search:
+python3 ~/.claude/skills/academic-research/academic_search.py search "query" --limit 20
 ```
 
 ## Core Workflows
@@ -89,23 +117,46 @@ When the user asks to "build a lit review on [topic]":
 
 When the user asks to "check my references", "verify citations", or provides a reference list:
 
-1. Prepare a JSON or text file with the references
-2. Run `python3 ~/.claude/skills/academic-research/academic_search.py verify <refs_file>`
-3. For each reference, the tool:
-   - Resolves DOIs via Crossref (authoritative DOI registry)
-   - Looks up PMIDs via PubMed
-   - Falls back to title/author search if no identifiers
-   - Compares manuscript fields against source-of-truth data
-   - Checks for retracted publications
-4. Present the verification report showing per-reference status (VERIFIED / ERRORS_FOUND / NOT_FOUND / RETRACTED)
-5. Highlight specific field mismatches (wrong year, wrong volume, etc.)
+1. Create `refs_to_verify.json` using an **absolute path** in the project working directory before running the script. Example:
+   ```json
+   [
+     {"label": "Ref1_Author2020", "doi": "10.1234/example", "title": "...", "authors": ["Author A"], "year": 2020, "journal": "...", "volume": "10", "issue": "3", "pages": "100-110"},
+     {"label": "Ref2_Smith2018", "pmid": "12345678"},
+     {"label": "Ref3_Jones2022", "doi": "https://doi.org/10.5678/xyz", "title": "..."}
+   ]
+   ```
+   - Use `label` fields (e.g. `"BC2_Douketis2015"`) to identify references in the report
+   - DOIs can be provided as bare (`10.1234/abc`), with `doi:` prefix, or as full URLs — all are normalized automatically
+   - Session files are saved to the current working directory; run from the project directory or use absolute paths
+
+2. Run:
+   ```bash
+   python3 ~/.claude/skills/academic-research/academic_search.py verify /abs/path/refs_to_verify.json --output /abs/path/verify_results.json
+   ```
+   - Use `--output /abs/path/results.json` to write the structured JSON output separately from the human-readable report
+   - Human-readable report always goes to stdout; `--output` cleanly separates the two streams
+
+3. For each reference, the tool applies a **three-layer fallback**:
+   - **Layer 1 — Crossref**: resolves DOI directly (authoritative DOI registry, best for volume/issue/pages)
+   - **Layer 2 — Semantic Scholar**: tried automatically when Crossref fails for a DOI (catches DOI typos resolved by S2's fuzzy matching)
+   - **Layer 3 — PubMed DOI field search**: `"<doi>"[doi]` query to obtain PMID when Crossref fails
+   - If no identifiers: falls back to title + author bibliographic search across Crossref and PubMed
+
+4. The tool compares manuscript fields against source-of-truth data and checks for retracted publications.
+
+5. Parse the output report — each reference shows:
+   - Status: `VERIFIED (N sources)` / `ERRORS_FOUND (N sources)` / `NOT_FOUND` / `RETRACTED`
+   - Label shown alongside index: `Reference 3 [Ref3_Jones2022]: VERIFIED (2 sources)`
+   - Field mismatches: `volume [XX] manuscript="373" vs source="374"`
+   - Confirmed metadata: `Confirmed: Vol 373(9):823-833 | PMID: 26095867 | Authors: Douketis JD...`
+   - Sources used: `Sources: Crossref, PubMed` (or `Semantic Scholar` if fallback was used)
 
 JSON input format:
 ```json
 [
-  {"title": "...", "authors": ["..."], "year": 2024, "doi": "...", "journal": "..."},
-  {"doi": "10.1234/example"},
-  {"pmid": "12345678"}
+  {"label": "BRIDGE_Douketis2015", "title": "...", "authors": ["..."], "year": 2015, "doi": "10.1056/NEJMoa1501035", "journal": "...", "volume": "373", "issue": "9", "pages": "823-833"},
+  {"label": "Ref2", "doi": "10.1234/example"},
+  {"label": "Ref3", "pmid": "12345678"}
 ]
 ```
 
@@ -157,8 +208,8 @@ When the user says "continue my research on [topic]" or "load my previous search
 
 | Source | Purpose | Key Required |
 |---|---|---|
-| Semantic Scholar | Search, citation counts, citation graphs, author search, recommendations | Optional (rate-limited without) |
-| PubMed | Search, clinical trial metadata, retraction checking | No |
+| Semantic Scholar | Search, citation counts, citation graphs, author search, recommendations, DOI fallback lookup | Optional (rate-limited without) |
+| PubMed | Search, clinical trial metadata, retraction checking, DOI field search | No |
 | Crossref | DOI resolution, citation verification, volume/issue/pages metadata | No |
 
 ## API Rate Limiting
@@ -244,3 +295,4 @@ Session files are saved as `research_session_{topic_slug}_{date}.json` in the wo
 - Full text is NOT available through any API -- only abstracts and metadata
 - Very recent publications (last 1-2 weeks) may have an indexing lag
 - The verify command checks for retracted publications via PubMed
+- DOI typos or URL-format DOIs are automatically normalized before lookup
